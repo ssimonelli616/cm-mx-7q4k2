@@ -23,22 +23,111 @@
       color: #fff; font: 600 18px/1.4 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; text-align: center; padding: 24px; }
     body.is-offline .offline { display: flex; }
     body.is-offline iframe { visibility: hidden; }
+    .notify { position: fixed; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom, 0px)); z-index: 5;
+      display: none; align-items: center; gap: 8px; border: 0; border-radius: 999px; padding: 12px 18px;
+      background: #8B1A1A; color: #fff; font: 700 15px/1 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      box-shadow: 0 6px 18px rgba(0,0,0,.3); cursor: pointer; }
+    .notify.show { display: inline-flex; }
+    .notify .x { margin-left: 4px; opacity: .8; font-weight: 400; }
   </style>
 </head>
 <body>
   <!-- The Maintenance Entry App (Google Apps Script web app) -->
   <iframe src="https://script.google.com/macros/s/AKfycbwVKF3b_OmaYhuXio7CdqKu1qdoQ5bvKmO7CMnvMxIvjj1mY2sTc52SkrqUlj6VZmMw/exec"
           title="Maintenance Entry App" allow="clipboard-write"></iframe>
+  <button class="notify" id="notify" type="button">🔔 Turn on notifications <span class="x" id="notify-x" aria-label="Hide">✕</span></button>
   <div class="offline">No internet connection.<br>The maintenance list will load when you're back online.</div>
 
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging-compat.js"></script>
   <script>
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('load', function () { navigator.serviceWorker.register('sw.js'); });
-    }
+    // Employee form script: phones register here to get new-request notifications
+    var REGISTER_URL = 'https://script.google.com/macros/s/AKfycbwmNdWWRnas4ccHdEIINIhxFsrvRCMsMtStprx9ifCpXg9ShWRsyJj4gnE37PZfiGGx/exec';
+    var VAPID_KEY = 'BIvR8OYXgUToW8l40AAY0hsNSxm0cq1LMzN2LTLPpyBcW1RZlPBirzKyILGzoWc8Cocc9kPd3pPAk6R5usrI_R0';
+    var FIREBASE_CONFIG = {
+      apiKey: 'AIzaSyAITf_I-gz_btPtnoIYnM4K0ihTtTBU66s',
+      authDomain: 'crown-maintenance.firebaseapp.com',
+      projectId: 'crown-maintenance',
+      storageBucket: 'crown-maintenance.firebasestorage.app',
+      messagingSenderId: '497420751997',
+      appId: '1:497420751997:web:ad48a5fb3ba9689407cd14'
+    };
+
+    // ---- Offline notice ----
     function net() { document.body.classList.toggle('is-offline', !navigator.onLine); }
     window.addEventListener('online', function () { net(); location.reload(); });
     window.addEventListener('offline', net);
     net();
+
+    var btn = document.getElementById('notify');
+    var swReg = null, messaging = null;
+    var supported = 'serviceWorker' in navigator && 'Notification' in window && 'PushManager' in window;
+
+    // Tell the employee script about this phone (JSONP, works from any site)
+    function register(token) {
+      return new Promise(function (resolve, reject) {
+        var cb = 'cmReg_' + Date.now();
+        var s = document.createElement('script');
+        var t = setTimeout(function () { done(new Error('timeout')); }, 30000);
+        function done(err, res) {
+          clearTimeout(t); try { delete window[cb]; } catch (e) {} if (s.parentNode) s.parentNode.removeChild(s);
+          if (err || !res || !res.ok) return reject(err || new Error((res && res.error) || 'failed'));
+          resolve(res);
+        }
+        window[cb] = function (res) { done(null, res); };
+        s.onerror = function () { done(new Error('network')); };
+        s.src = REGISTER_URL + '?action=register&token=' + encodeURIComponent(token) + '&callback=' + cb + '&_=' + Date.now();
+        document.head.appendChild(s);
+      });
+    }
+
+    function getToken() {
+      return messaging.getToken({ vapidKey: VAPID_KEY, serviceWorkerRegistration: swReg }).then(function (token) {
+        if (!token) throw new Error('no token');
+        if (localStorage.getItem('cmPushToken') === token) return token;   // already registered
+        return register(token).then(function () { localStorage.setItem('cmPushToken', token); return token; });
+      });
+    }
+
+    // Clear the icon number and old notifications whenever the app is opened
+    function clearBadge() {
+      if (navigator.clearAppBadge) navigator.clearAppBadge().catch(function () {});
+      if (swReg && swReg.getNotifications) swReg.getNotifications().then(function (list) { list.forEach(function (n) { n.close(); }); });
+    }
+
+    function showButton() {
+      var hidden = localStorage.getItem('cmNotifyHidden') === '1';
+      btn.classList.toggle('show', supported && Notification.permission === 'default' && !hidden);
+    }
+
+    btn.addEventListener('click', function (e) {
+      if (e.target.id === 'notify-x') { localStorage.setItem('cmNotifyHidden', '1'); showButton(); return; }
+      Notification.requestPermission().then(function (perm) {
+        showButton();
+        if (perm !== 'granted') { alert('Notifications are blocked. You can allow them later in your phone\'s settings for this app.'); return; }
+        return getToken().then(function () {
+          alert('Notifications are on. You\'ll get an alert when a new maintenance request comes in.');
+        });
+      }).catch(function () {
+        alert('Could not turn on notifications right now. Please try again in a moment.');
+      });
+    });
+
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('sw.js').then(function (reg) {
+        swReg = reg;
+        clearBadge();
+        if (!supported || !window.firebase) return;
+        firebase.initializeApp(FIREBASE_CONFIG);
+        messaging = firebase.messaging();
+        // App open when a request arrives: no pop-up needed, the list refreshes itself
+        messaging.onMessage(function () {});
+        // Already allowed: keep this phone's registration current
+        if (Notification.permission === 'granted') getToken().catch(function () {});
+        showButton();
+      });
+    }
+    document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'visible') clearBadge(); });
   </script>
 </body>
 </html>
